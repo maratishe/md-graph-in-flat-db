@@ -1,48 +1,50 @@
-# ハンズオン：フラットDBにおけるグラフ構造を用いたファイルライフサイクル追跡
+# Hands-on: Embedding Graphs into plaintext/flat DB and using them for tracing and/or MD visualization
 
-**所要時間：** 読了 約20〜30分、ハンズオン実施 約1〜2時間  
-**前提条件：** Node.js (v16以上)、SQLite3 CLI、テキストエディタまたはVS Code  
-**データセット：** 匿名化済みの業務ログ（JSON形式で提供）
+**Duration:** ~20–30 min reading, ~1–2 hours hands-on with code  
+**Prerequisites:** Node.js (v16+), SQLite3 CLI, a text editor or VS Code  
+**Dataset:** Anonymized log entries (provided as JSON)
 
-## 概要
+## Overview
 
-多くのエンタープライズシステムでは、1つのファイル（例：会議録音の音声ファイル）が複数の処理ステージを通過し、異なる従業員によって操作され、複数のセッションに跨って参照されます。このようなファイルのライフサイクル全体を把握するには、通常グラフベースの分析が必要ですが、Neo4j [1] や TigerGraph [2] のような専用グラフデータベースの導入は、既存インフラとの整合性やコスト面で必ずしも現実的ではありません。
+In many enterprise systems, a single file — such as a recorded meeting audio — passes through multiple processing stages, is handled by different employees, and appears across many sessions. Understanding the full lifecycle of such a file typically requires graph-based analysis, but deploying a dedicated graph database (e.g., Neo4j [1], TigerGraph [2]) is often impractical when your infrastructure is built around relational databases.
 
-本ハンズオンでは、その軽量な代替手段を紹介します。**フラットなリレーショナルデータベース（SQLite [3]）の1つのテキストフィールドに多次元のグラフ関係を埋め込み**、SQL、Mermaid [4]、Graphviz [5] を使ってそれらの関係を抽出・可視化する手法です。
+This hands-on demonstrates a lightweight alternative: **embedding multi-dimensional graph relationships into a single text field** in a flat relational database (SQLite [3]), then extracting and visualizing those relationships using SQL, Mermaid [4], and Graphviz [5].
 
-本セッション終了後、以下のことができるようになります：
+By the end of this session, you will be able to:
 
-1. フラットDBスキーマにグラフ的な関係性をエンコードする方法の理解
-2. 再帰SQL（Recursive CTE）を用いて複数値フィールドの分割・重複排除・追跡を行うクエリの作成
-3. メトロマップ形式のダイアグラムによるトレース関係の可視化
-
-
-## 目次
-
-1. **データの確認：** 複数の次元（ファイル名、従業員、セッション、処理ステージ等）を持つ実際のログエントリ
-2. **課題：** なぜ複数の次元を1つのフィールドに埋め込む必要があるか
-3. **解法1：** グラフノードの定義（ファイル、セッション、処理ステージ、従業員）
-4. **解法2：** 各ユニーク識別子をMD5ハッシュで特定し、DB内の1フィールドに集約
-5. **解法3：** 再帰SQLによる分割・重複排除・追跡クエリ
-6. **解法4：** ユニーク識別子の一括抽出とメトロマップによる可視化
-7. **参考文献**
+1. Understand how to encode graph-like relationships in a flat DB schema
+2. Write recursive SQL queries to split, deduplicate, and trace multi-valued fields
+3. Visualize trace relationships as metromap-style diagrams
 
 
 
-## (1) データの確認：業務ログにおける複数の次元
+## Table of Contents
 
-本システムの各ログエントリは、**複数の次元を同時に参照する**イベントを記録しています：
+1. **The Data:** Show actual log entries with multiple dimensions (filename, employee, session, processing stage, etc.)
+2. **The Problem:** Why we need to embed multiple dimensions into a single field
+3. **Answer 1:** Define graph nodes (files, sessions, processing stages, employees)
+4. **Answer 2:** Identify each unique node by its MD5 hash and store all IDs in a single DB field
+5. **Answer 3:** Query using recursive SQL to split, deduplicate, and trace
+6. **Answer 4:** Extract unique identifiers in bulk and visualize as metromap graphs
+7. **References**
 
-| 次元 | フィールド | 例 |
-|------|-----------|-----|
-| **ファイル** | `file_id`, `file_ids`, `deleted_files` | `file_0008.mp3` |
-| **従業員** | `employee_code` | `POOW` |
-| **セッション** | `session_id`, `trace_ids` | `7de98ea6e91a` |
-| **処理ステージ** | `span_id` | `BE.function2.get` |
-| **場所** | `location` | `location1-backend-somewhere` |
-| **時刻** | `created_at` | `2026-02-04T08:48:56.816835+00:00` |
 
-以下は匿名化済みデータセットからの3つの代表的なログエントリです。1つの `BE.function2.get` 呼び出しが9つのファイルを参照し、`BE.file.new` エントリがファイルを `trace_ids` を介してセッションにリンクしている点に注目してください：
+## (1) The Data: Multiple Dimensions in Business Logs
+
+Each log entry in our system records an event that may reference **multiple dimensions simultaneously**:
+
+| Dimension | Field(s) | Example |
+|-----------|----------|---------|
+| **File** | `file_id`, `file_ids`, `deleted_files` | `file_0008.mp3` |
+| **Employee** | `employee_code` | `POOW` |
+| **Session** | `session_id`, `trace_ids` | `7de98ea6e91a` |
+| **Processing stage** | `span_id` | `BE.function2.get` |
+| **Location** | `location` | `location1-backend-somewhere` |
+| **Time** | `created_at` | `2026-02-04T08:48:56.816835+00:00` |
+
+Here are three representative log entries from the anonymized dataset. Notice how each entry combines several of these dimensions — a single `BE.function2.get` call references 9 files, while a `BE.file.new` entry links a file to a session via `trace_ids`:
+
+Here are three representative log entries from the anonymized dataset. Notice how each entry combines several of these dimensions — a single `BE.function2.get` call references 9 files, while a `BE.file.new` entry links a file to a session via `trace_ids`:
 
 ```
 ...
@@ -85,68 +87,73 @@
 ...
 ```
 
-ここで重要なのは、**エンティティ間の関係が暗黙的である**ということです。関係性は `details` フィールド内のJSONに埋もれており、`trace_ids`、`employee_code`、`span_id` の各カラムに散在しています。ファイルのライフサイクルを追跡するには、これらすべての次元を横断的に結合する必要があります。これはまさにグラフデータベースが得意とする処理ですが、本ハンズオンではグラフDBなしでこれを実現します。
+The key observation is that **relationships between entities are implicit** — they are buried inside JSON blobs in the `details` field and scattered across the `trace_ids`, `employee_code`, and `span_id` columns. To trace a file's lifecycle, you would need to join across all of these dimensions, which is exactly what a graph database excels at — but we want to do it without one.
 
 
 
-## (2) 課題：複数の次元を1つのフィールドに埋め込む
+## (2) The Problem: Embedding Multiple Dimensions in a Single Field
 
-### なぜグラフデータベースを使わないのか？
+### Why not use a graph database?
 
-Neo4j [1] や TigerGraph [2] のようなグラフネイティブソリューションは、多次元の関係データを扱うために設計されています。ノード（ファイル、従業員、セッション）とエッジ（それらの間の関係）をネイティブに表現できます。しかし：
+Graph-native solutions like Neo4j [1] or TigerGraph [2] are purpose-built for multi-dimensional relationship data. They can natively represent nodes (files, employees, sessions) and edges (relationships between them). However:
 
-- **追加インフラが必要** — 別途データベースサーバー、新しいクエリ言語（Cypher [6]、GSQL）、運用コストが発生する
-- 多くのチームはこれらのログを格納する**既存のリレーショナルデータベース**（PostgreSQL、MySQL、SQLite）を既に持っている
-- 数千〜数百万行規模の探索的分析では、グラフDBの導入コストは正当化しにくい
+- They require **additional infrastructure** — a separate database server, new query languages (Cypher [6], GSQL), and operational overhead
+- Many teams already have **existing relational databases** (PostgreSQL, MySQL, SQLite) that store these logs
+- For exploratory analysis and small-to-medium datasets (thousands to low millions of rows), the overhead of a graph DB is not justified
 
-### なぜ可視化ツールを直接使わないのか？
+### Why not use visualization tools directly?
 
-Graphviz [5]（dot記法、メトロマップ）や Mermaid [4] はグラフ描画に優れたツールですが、**構造化された入力**が必要です。生のログデータは、可視化の前にパース・抽出のステージを経る必要があります。
+Tools like Graphviz [5] (dot notation, metromaps) and Mermaid [4] are excellent for rendering graphs, but they require **structured input**. Raw log data needs a parsing and extraction stage before it can be visualized.
 
-### アプローチ：graph-in-flat-DB
+### The approach: graph-in-flat-DB
 
-考え方はシンプルです：
+The idea is simple:
 
-1. 各ログエントリから全てのユニーク識別子（ファイル名、セッションID等）を**抽出**する
-2. 各識別子を短い衝突耐性のある文字列に**ハッシュ化**する（MD5の先頭14文字）
-3. 1つのログエントリに対応する全ハッシュをスペース区切りで `trace_ids` フィールドに**格納**する
-4. 再帰SQLを用いて関係の分割・結合・追跡を**クエリ**する
-5. ユニークな共起パターンをメトロマップグラフとしてエクスポートし**可視化**する
+1. **Extract** all unique identifiers (file names, session IDs, etc.) from each log entry
+2. **Hash** each identifier to a short, collision-resistant string (14-character MD5 prefix)
+3. **Store** all hashes for a given log entry in a single space-delimited `trace_ids` field
+4. **Query** using recursive SQL to split, join, and trace relationships
+5. **Visualize** by exporting unique co-occurrence patterns as metromap graphs
 
-これにより、既存のリレーショナルデータベースを活用しつつ、エンティティ間の多次元的な関係性を捕捉できます。最終的な目標は2つです：
+This lets you leverage your existing relational database while capturing the multi-dimensional relationships between entities. The two ultimate goals are:
 
-1. **ライフサイクル追跡：** 1つのファイルが処理ステージ、セッション、従業員を跨いでどう流れるかを追跡する
-2. **パターン発見：** Python [7] やRのグラフ分析ライブラリを用いて、中心性、クラスタリング、異常検知などのグラフ分析を行う — DBから抽出したトレースIDのバッチを入力として使用する
-
-
-
-## (3) 解法1：グラフノードの定義
-
-従来のグラフモデルでは、明示的なノードタイプとエッジタイプを定義します。本アプローチでは、よりシンプルなスタンスを取ります：
-
-> **1つのログエントリが1つのノード。そのエントリに含まれるユニーク識別子は、同じ識別子を共有する他のノードへの「リンク」である。**
-
-つまり：
-
-- **ファイル**（`file_0008.mp3`）はそれ自体ノードではなく、`file_0008.mp3` に言及する全てのログエントリが、同じく言及する他の全てのログエントリと接続される
-- **従業員**（`POOW`）も同様に、その従業員に関連する全てのログエントリを接続する
-- **セッション**は、同一セッションIDを共有する全てのログエントリを接続する
-
-「エッジ」は暗黙的です：2つのログエントリが `trace_ids` フィールドで少なくとも1つの識別子を共有していれば、それらは接続されています。共有する識別子が多いほど、接続は強くなります。これは本質的に**ハイパーグラフ** [8] をフラットなリレーショナルスキーマに射影したものです。
+1. **Lifecycle tracing:** follow a single file across processing stages, sessions, and employees over time
+2. **Pattern discovery:** identify clusters, central nodes, and anomalies using graph analysis libraries in Python [7], R, or other tools — fed by batches of trace IDs extracted from the DB
 
 
-## (4) 解法2：ハッシュベースの識別
 
-複数の識別子を1つのテキストフィールドに効率的に格納するため、各ユニーク値（ファイル名、セッションID等）をMD5でハッシュ化し、先頭14文字の16進数に切り詰めます：
+
+
+## (3) Answer 1: Define Graph Nodes
+
+In a traditional graph model, you would define explicit node types and edge types. In our approach, we take a simpler stance:
+
+> **One log entry is a node. Whatever unique identifiers appear in that entry are "links" to other nodes that share the same identifiers.**
+
+This means:
+
+- A **file** (`file_0008.mp3`) is not a node itself — rather, every log entry that mentions `file_0008.mp3` becomes connected to every other log entry that also mentions it
+- An **employee** (`POOW`) similarly connects all log entries associated with that employee
+- A **session** connects all log entries that share the same session ID
+
+The "edges" are implicit: two log entries are connected if they share at least one identifier in their `trace_ids` field. The more identifiers they share, the stronger the connection. This is essentially a **hypergraph** [8] projected onto a flat relational schema.
+
+
+## (4) Answer 2: Hash-Based Identification
+
+To store multiple identifiers efficiently in a single text field, we hash each unique value (file name, session ID, etc.) using MD5 and truncate to the first 14 hexadecimal characters:
 
 - `md5("file_0001.mp3")` → `e2c569be17396eca2a2e3c11578123ed` → **`e2c569be17396e`**
 
-**なぜ14文字か？** 14桁の16進数における衝突確率は約 1/16¹⁴ ≈ 1/7.2×10¹⁶ です。数千〜数百万のユニーク識別子を持つデータセットでは、実質的にゼロと見なせます。切り詰めにより格納領域を節約し、`trace_ids` フィールドの可読性も向上します。
+**Why 14 characters?** The collision probability for 14 hex chars is approximately 1 in 16¹⁴ ≈ 7.2 × 10¹⁶. For datasets with thousands to millions of unique identifiers, this is effectively zero. The truncation saves storage space and makes the `trace_ids` field more readable.
 
-ハッシュ化は [`runme-js-to-db.js`](md-graph-in-flat-db/runme-js-to-db.js) スクリプトによりデータベース初期化時に実行されます。各ログエントリの `details` JSONフィールドをパースし、ファイルID、セッションID、その他のユニーク値を抽出し、各値をハッシュ化して、スペース区切りで `trace_ids` フィールドに連結します。
+The hashing is performed by the [`runme-js-to-db.js`](md-graph-in-flat-db/runme-js-to-db.js) script during database initialization. It parses the `details` JSON field of each log entry, extracts file IDs, session IDs, and other unique values, hashes each one, and concatenates them with spaces into the `trace_ids` field.
 
-結果として得られるスキーマは以下の通りです：
+The resulting schema looks like this:
+ - filename -> `md5("file_0001.mp3")` -> `e2c569be17396eca2a2e3c11578123`
+ - unique to 14 head chars: `e2c569be17396e`, collision probability is very low (1 in 16^14 = 1 in 7.2e16)
 
+So, in db we have:
 ```
 span_id                             | details (with embedded md5 hash ids for files, sessions, etc.) | trace_ids (md5 of file names, session ids, etc.)
 BE.function2.get                     | file_0051.mp3, file_0086.mp3, file_0087.mp3, fil | 4931d3afc6e672 4d22a4251f1d1c 4eb6bf15031600 2479dde7ed882b 807b6b1724d30e
@@ -155,33 +162,36 @@ BE.function3.files.after             | file_0024                                
 BE.function3.files.before            | file_0024                                        | f90197d492238b
 ```
 
-各行の `trace_ids` フィールドは、14文字のハッシュをスペースで区切ったリストです。5つのファイルを返す `BE.function2.get` 呼び出しには5つのハッシュが含まれます。1つのファイルを処理する `BE.function3.post.done` 呼び出しには1つのハッシュのみが含まれます。このエンコーディングが、後続の全てのクエリの基盤となります。
+Each row's `trace_ids` field is a space-delimited list of 14-character hashes. A `BE.function2.get` call that returns 5 files will have 5 hashes in its `trace_ids`. A `BE.function3.post.done` call that processes a single file will have just 1 hash. This encoding is the foundation for all subsequent queries.
 
 
 
-## (5) 解法3：再帰SQLによるクエリ
+## (5) Answer 3: Querying with Recursive SQL
 
-識別子が `trace_ids` フィールドに埋め込まれたので、次はそれらを抽出・分析するSQLクエリが必要です。SQLiteの再帰共通テーブル式（Recursive CTE）[9] のサポートにより、アプリケーションコードなしでこれが可能になります。
+Now that identifiers are embedded in the `trace_ids` field, we need SQL queries to extract and analyze them. SQLite's support for recursive Common Table Expressions (CTEs) [9] makes this possible without any application code.
 
-### 準備
+### Setup
 
-クエリを実行する前に、ローカルのSQLiteデータベースをセットアップします：
+Before running the queries, set up the local SQLite database:
 
-1. **Node.js**（v16以降）がインストールされていることを確認
-2. `better-sqlite3` パッケージをインストール：`npm install better-sqlite3`
-3. 匿名化済みデータセットからデータベースを初期化：
-
-これにより、匿名化済みの全ログエントリと事前計算された `trace_ids` を含む `BusinessLog` テーブルを持つ `260206.db` SQLiteファイルが作成されます。
-
-以下のサブセクションでは、単純な閲覧から完全なライフサイクル追跡まで、段階的にクエリの複雑さを積み上げていきます。
+1. Ensure you have **Node.js** (v16 or later) installed
+2. Install the `better-sqlite3` package: `npm install better-sqlite3`
+3. Initialize the database from the anonymized dataset:
 
 ```bash
 node runme-js-to-db.js --db 260206.db --command initdb --input 260206-dataset-anonymized.json 
 ```
 
-### (5-1) ステップ1：trace_idsの確認（クエリ：`260206-Q1.sql`）
 
-最もシンプルなクエリとして、1つ以上のトレースIDを持つ全ログエントリを取得します。これにより、データの量と `trace_ids` フィールドの構造を把握できます：
+This creates a `260206.db` SQLite file with a `BusinessLog` table containing all the anonymized log entries, complete with pre-computed `trace_ids`.
+
+The following subsections build up query complexity incrementally — from simple viewing to full lifecycle tracing.
+
+
+### (5-1) Step 1: View raw trace_ids (query: `260206-Q1.sql`)
+
+The simplest query just retrieves all log entries that have at least one trace ID. This gives you a feel for the data volume and the structure of the `trace_ids` field:
+
 
 ```sql
 -- Simple view of all entries with trace_ids
@@ -195,7 +205,7 @@ WHERE trace_ids IS NOT NULL AND trace_ids != ''
 ORDER BY created_at;
 ```
 
-出力を見ると、単一のハッシュを持つエントリ（例：`c71b345135dfd9` — 1つのファイル）もあれば、スペースで区切られた複数のハッシュを持つエントリ（例：14個のファイルハッシュを持つ `BE.function2.get`）もあることが分かります。複数値のエントリこそが関係性をエンコードしているものです — 1回のAPI呼び出しで「一緒に見られた」ファイル群を示しています。
+run sql against the local db:
 
 ```bash
 sqlite3 260206.db < 260206-Q1.sql
@@ -217,9 +227,12 @@ sqlite3 260206.db < 260206-Q1.sql
 ...
 ```
 
-### (5-2) ステップ2：スペース区切りのtrace_idsを行に分割（クエリ：`260206-Q2.sql`）
+Notice that some entries have a single hash (e.g., `c71b345135dfd9` — a single file), while others have many hashes separated by spaces (e.g., the `BE.function2.get` entry with 14 file hashes). The multi-valued entries are the ones that encode relationships — they tell us which files were "seen together" in a single API call.
 
-個々のトレースIDを扱うには、スペース区切りの文字列を個別の行に分割する必要があります。SQLiteにはビルトインの `STRING_SPLIT` 関数がありません（PostgreSQLの `STRING_TO_TABLE` やSQL Serverの `STRING_SPLIT` とは異なります）。そこで、1つずつトークンを剥がしていく**再帰CTE** [9] を使用します：
+
+### (5-2) Step 2: Split space-delimited trace_ids into rows (query: `260206-Q2.sql`)
+
+To work with individual trace IDs, we need to split the space-delimited string into separate rows. SQLite doesn't have a built-in `STRING_SPLIT` function (unlike PostgreSQL's `STRING_TO_TABLE` or SQL Server's `STRING_SPLIT`), so we use a **recursive CTE** [9] that peels off one token at a time:
 
 ```sql
 -- Split space-delimited trace_ids into individual rows
@@ -268,7 +281,7 @@ WHERE trace_id != ''
 ORDER BY created_at;
 ```
 
-実行して以下のように出力される：
+run it against the local db:
 
 ```bash
 sqlite3 260206.db < 260206-Q2.sql
@@ -293,17 +306,18 @@ sqlite3 260206.db < 260206-Q2.sql
 378793|BE.function2.get|2026-01-20T07:53:49.812955+00:00|ff3b3983d02faa
 ```
 
-再帰CTEは2つのフェーズで動作します：
+The recursive CTE works in two phases:
 
-1. **ベースケース：** `BusinessLog` の各行について、最初のトークン（最初のスペースまでの部分）を抽出し、残りを保持する
-2. **再帰ケース：** 残りの部分から次のトークンを抽出し、空になるまで繰り返す
+1. **Base case:** For each row in `BusinessLog`, extract the first token (everything before the first space) and store the remainder
+2. **Recursive case:** From the remainder, extract the next token and repeat until nothing is left
 
-結果として、`378772|BE.function2.get|e844141f43e3f7 ae7a40b9fa4a21|...` のような1行が、各トレースIDごとに2行に展開されます。この「展開」されたビューが、後続の全ての分析（集計、グルーピング、結合、追跡）の基盤となります。
+The result is that a single row like `378772|BE.function2.get|e844141f43e3f7 ae7a40b9fa4a21|...` is expanded into two rows — one for each trace ID. This "exploded" view is the foundation for all downstream analysis: counting, grouping, joining, and tracing.
 
 
-### (5-3) ステップ3：ユニークなトレースIDの抽出（クエリ：`260206-Q3.sql`）
 
-分割CTEを基に、`SELECT DISTINCT` を使ってデータセット内の全ユニーク識別子のセットを抽出できます：
+### (5-3) Step 3: Extract unique trace IDs (query: `260206-Q3.sql`)
+
+Building on the split CTE, we can extract the complete set of unique identifiers in the dataset with `SELECT DISTINCT`:
 
 ```sql
 -- Get all unique trace_ids
@@ -350,7 +364,7 @@ WHERE trace_id != ''
 ORDER BY trace_id;
 ```
 
-実装する：
+run it against the local db:
 
 ```bash
 sqlite3 260206.db < 260206-Q3.sql | more
@@ -369,16 +383,16 @@ sqlite3 260206.db < 260206-Q3.sql | more
 ...
 ```
 
-ユニークIDのフラットなリストはそれ自体ではあまり有用ではありません — どのIDがファイルを表し、どれがセッションを表すかは判別できません（その情報はハッシュ化の過程で意図的に失われています）。しかし、このリストは2つの重要な目的に役立ちます：
+A flat list of unique IDs is not very useful on its own — you cannot tell which ID represents a file, a session, or something else (that information is lost during hashing, by design). However, this list serves two important purposes:
 
-1. **カーディナリティの確認：** データセット内にユニークなエンティティがいくつ存在するか？ これによりグラフの複雑さを見積もれます。
-2. **構成要素：** 分割CTEや追加の結合と組み合わせることで、次のステップの完全なライフサイクルクエリの基盤となります。
+1. **Cardinality check:** How many unique entities exist in the dataset? This helps you gauge the complexity of the graph.
+2. **Building block:** Combined with the split CTE and additional joins, these IDs become the foundation for the full lifecycle query in the next step.
 
 
 
-### (5-4) ステップ4：完全なライフサイクル追跡（クエリ：`260206-Q4.sql`）
+### (5-4) Step 4: Full lifecycle tracing (query: `260206-Q4.sql`)
 
-これが集大成のクエリです。再帰的な分割と集約（`COUNT`、`MIN`、`MAX`）、そして結合を組み合わせて、全てのトレースIDの完全なタイムラインを出現頻度順に生成します：
+This is the culminating query. It combines the recursive split with aggregation (`COUNT`, `MIN`, `MAX`) and a join to produce a complete timeline for every trace ID, ordered by frequency:
 
 ```sql
 -- Summary: count of entries per trace_id with timeline
@@ -452,7 +466,7 @@ ORDER BY c.entry_count DESC, e.trace_id, e.created_at;
 ```
 
 
-実行して以下のように出力される：
+run it against the local db:
 
 ```bash
 sqlite3 260206.db < 260206-Q4.sql | more
@@ -475,53 +489,56 @@ c7a6ba3a2c7b1b|630|BE.function2.get|2026-02-01T23:56:41.229994+00:00|POOW
 ...
 ```
 
-このクエリは3つの論理的なステージで構成されています：
+The query has three logical stages:
 
-1. **`split_trace`** — `trace_ids` を個別の行に分割する再帰CTE。`log_id`、`span_id`、`created_at`、`employee_code` を併せて運搬する
-2. **`trace_entries`** — 空のトレースIDを除外するシンプルなフィルタ
-3. **`trace_counts`** — 集約：各トレースIDを参照するログエントリの数、および最初と最後に観測された時刻
+1. **`split_trace`** — Recursive CTE that splits `trace_ids` into individual rows, carrying along `log_id`, `span_id`, `created_at`, and `employee_code`
+2. **`trace_entries`** — Simple filter to remove empty trace IDs
+3. **`trace_counts`** — Aggregation: how many log entries reference each trace ID, and when it was first/last seen
 
-最後の `SELECT` でエントリとカウントを結合し、最も参照頻度の高いトレースIDから順に並んだ非正規化タイムラインを生成します。
-
-出力カラムは以下の通りです：
-
-| カラム | 説明 |
-|--------|------|
-| `hash_id` | ファイル名、セッションID、その他のユニーク識別子のMD5ハッシュ（14文字） |
-| `entry_count` | このトレースIDを参照するログエントリの総数 |
-| `span_id` | 処理ステージまたは関数名（例：`BE.function2.get`、`BE.file.new`） |
-| `created_at` | ログエントリのタイムスタンプ（ISO 8601形式） |
-| `employee_code` | 匿名化済みの従業員識別子 |
-
-
-#### 出力の読み方
-
-最も参照頻度の高いトレースID（`c7a6ba3a2c7b1b`、630エントリ）を時系列で読むと、明確なストーリーが見えます：
-
-1. **ポーリングフェーズ**（`BE.function2.get` の繰り返し）：ユーザーがファイル一覧を複数回確認する
-2. **アップロードフェーズ**（`BE.file.new` → `BE.file.linked`）：新規ファイルが作成され、リンクされる
-3. **外部処理**（`function6.session.complete`）：外部サービス（例：文字起こし）が処理を完了する
-4. **後処理**（`BE.function1.post.file`）：バックエンドがファイルを最終処理する
-5. **後続のポーリング**（`BE.function2.get` の再度の繰り返し）：ファイルが以降のリスト取得で表示されるようになる
-
-これは**1つのファイルのライフサイクル** — アップロードから外部処理を経て利用可能になるまで — をフラットなログデータからSQLのみで追跡したものです。
+The final `SELECT` joins entries with counts, producing a denormalized timeline sorted by most-referenced trace IDs first.
 
 
 
+The output columns are:
 
-## (6) 解法4：メトロマップによる可視化
+| Column | Description |
+|--------|-------------|
+| `hash_id` | 14-char MD5 hash of a file name, session ID, or other unique identifier |
+| `entry_count` | Total number of log entries that reference this trace ID |
+| `span_id` | Processing stage or function name (e.g., `BE.function2.get`, `BE.file.new`) |
+| `created_at` | Timestamp of the log entry (ISO 8601) |
+| `employee_code` | Anonymized employee identifier |
 
-ライフサイクルクエリ（5-4）ではテキストベースのタイムラインが得られました。しかし、多数のトレースIDにわたるパターンを同時に発見するには、**視覚的な表現**が必要です。ここでは「メトロマップ」のメタファーを用います：
+### Reading the output
 
-- 各**ユニークハッシュID**が「駅」
-- **ユニークなハッシュIDの組み合わせ**（つまり、ログエントリの `trace_ids` の各固有値）が、それらの駅を通過する「路線」
-- 頻繁に一緒に出現する駅は密に接続されている — 同じ操作で共起するエンティティを表す
+The most-referenced trace ID (`c7a6ba3a2c7b1b`, 630 entries) tells a clear story when read chronologically:
 
-これは本質的に、交通路線図として射影された**共起グラフ** [10] です。
+1. **Polling phase** (`BE.function2.get`, repeated): The user checks the file list multiple times
+2. **Upload phase** (`BE.file.new` → `BE.file.linked`): A new file is created and linked
+3. **External processing** (`function6.session.complete`): An external service (e.g., transcription) completes its work
+4. **Post-processing** (`BE.function1.post.file`): The backend finalizes the file
+5. **Subsequent polling** (`BE.function2.get`, repeated again): The file now appears in future list retrievals
 
-### (6-1) SQLによる路線の抽出
+This is the **lifecycle of a single file** — from upload through external processing to availability — traced entirely from flat log data using SQL.
 
-以下のクエリは、2つ以上のハッシュを含む（つまり複数エンティティの関係を持つ）`trace_ids` の固有値を上位10件取得します：
+
+
+## (6) Answer 4: Metromap Visualization
+
+The lifecycle query (5-4) gives us a textual timeline. But for pattern discovery across many trace IDs simultaneously, we need a **visual representation**. We use the "metromap" metaphor:
+
+- Each **unique hash ID** is a "station"
+- Each **unique combination of hash IDs** (i.e., a distinct `trace_ids` value from a log entry) is a "train line" that passes through those stations
+- Stations that appear together frequently are tightly connected — they represent entities that co-occur in the same operations
+
+This is essentially a **co-occurrence graph** [10] projected as a transit map.
+
+### (6-1) Extracting train lines via SQL
+
+The following query selects the top 10 distinct `trace_ids` values that contain more than one hash (i.e., multi-entity relationships):
+
+
+(6-1) let's get some trains via sql:
 
 ```sql
 -- Get unique trace_id lists that contain more than 1 id (space-delimited), top 10
@@ -534,7 +551,10 @@ ORDER BY trace_ids
 LIMIT 10;
 ```
 
-以下のような出力が得られる：
+
+### (6-1) Extracting train lines via SQL
+
+The following query selects the top 10 distinct `trace_ids` values that contain more than one hash (i.e., multi-entity relationships):
 
 ```bash
 03951b21d95b3a 7d99009ec76167
@@ -549,9 +569,10 @@ LIMIT 10;
 046ffc14874a96 c3736083f514d9 fcb338a9e961f7 6d84c4164522d2 edcee1d5463a87 2329edd4ec5a22 d274b4f22ada77
 ```
 
-### (6-2) Mermaidメトロマップ
 
-これらの路線を Mermaid [4] の `graph LR` ダイアグラムに変換できます。各ユニークハッシュはラベル付きノード（可読性のため先頭6文字と末尾6文字を表示）となり、各路線は路線番号でラベル付けされた有向エッジの列になります：
+### (6-2) Mermaid metromap
+
+We can convert these train lines into a Mermaid [4] `graph LR` diagram. Each unique hash becomes a labeled node (showing the first 6 and last 6 characters for readability), and each train line becomes a sequence of directed edges labeled with the line number:
 
 ```
 graph LR
@@ -612,14 +633,14 @@ graph LR
     style K fill:#34495e,color:#fff
 ```
 
-結果＝画像は以下になります：
+, which results in something like
 
 ![](README-sketch.png)
 
 
-### (6-3) Graphvizによる代替表現
+### (6-3) Graphviz alternative
 
-Graphviz [5] では `dot` 言語を使ってより簡潔な記法が可能です。各路線は `--` で駅を接続する1つのステートメントになります。レイアウトエンジンがノードの配置とエッジのルーティングを自動的に処理します：
+Graphviz [5] offers a more compact syntax using its `dot` language. Each train line is a single statement with `--` connecting the stations. The layout engine automatically handles node positioning and edge routing:
 
 ```
 graph G {
@@ -636,33 +657,48 @@ graph G {
 }
 ```
 
-結果は以下の通り：
+, which results in:
 
 ![](README-sketch-graphviz.png)
 
 
-より大規模なデータセットでは、数百〜数千の路線をエクスポートし、NetworkX [7]（Python）や igraph [11]（R/Python）のようなライブラリを使って、中心性指標の計算、コミュニティ検出、異常検知などのグラフ分析をプログラム的に行うことができます。
+### (6-4) Reading the metromap
+
+Two distinct clusters are visible:
+
+1. **Red cluster** (stations `03951b`, `7d9900`, `881b35`): Three stations connected by 3 train lines. This represents a small group of entities (likely 2–3 files or a file + session) that appear together in various combinations. The triangle pattern suggests these entities are closely related — perhaps files uploaded in the same batch.
+
+2. **Blue/multi-color cluster** (stations `046ffc`, `843a36`, `c37360`, `fcb338`, `6d84c4`, `edcee1`, `2329ed`, `d274b4`): Eight stations connected by 7 train lines. This is a more complex lifecycle — a file that accumulates relationships over time as it passes through processing stages. The "core" stations (`046ffc`, `c37360`, `fcb338`) appear in almost every line, while peripheral stations (`843a36`, `d274b4`) appear in fewer lines.
+
+The metromap reveals **structural patterns** that are invisible in tabular data:
+
+- **Hub stations** (high degree) represent entities central to many operations
+- **Peripheral stations** (low degree) represent entities involved in specific stages only
+- **Line density** between stations indicates how frequently those entities co-occur
+
+For larger datasets, you would export hundreds or thousands of train lines and analyze the resulting graph programmatically using libraries like NetworkX [7] (Python) or igraph [11] (R/Python) to compute centrality measures, detect communities, and identify anomalies.
+
+---
+
+
+## Summary
+
+| Step | What | Tool |
+|------|------|------|
+| Data prep | Hash identifiers, store in `trace_ids` | Node.js + better-sqlite3 |
+| Query 1 | View raw trace_ids | SQLite CLI |
+| Query 2 | Split multi-valued field into rows | Recursive CTE |
+| Query 3 | Extract unique identifiers | `SELECT DISTINCT` |
+| Query 4 | Full lifecycle timeline | Recursive CTE + JOIN + aggregation |
+| Visualize | Metromap diagram | Mermaid / Graphviz |
+
+The key insight is that **you don't need a graph database to do graph analysis**. By encoding relationships as space-delimited hashes in a single field, you can use standard SQL to extract, split, and trace those relationships — and then feed the results into any visualization or graph analysis tool.
 
 
 
 ---
 
-## まとめ
-
-| ステップ | 内容 | ツール |
-|----------|------|--------|
-| データ準備 | 識別子のハッシュ化、`trace_ids` への格納 | Node.js + better-sqlite3 |
-| クエリ1 | trace_idsの生データ確認 | SQLite CLI |
-| クエリ2 | 複数値フィールドを行に分割 | 再帰CTE |
-| クエリ3 | ユニーク識別子の抽出 | `SELECT DISTINCT` |
-| クエリ4 | 完全なライフサイクルタイムライン | 再帰CTE + JOIN + 集約 |
-| 可視化 | メトロマップダイアグラム | Mermaid / Graphviz |
-
-重要な知見は、**グラフ分析にグラフデータベースは必須ではない**ということです。関係性をスペース区切りのハッシュとして1つのフィールドにエンコードすることで、標準的なSQLでそれらの関係を抽出・分割・追跡でき、その結果を任意の可視化ツールやグラフ分析ツールに入力できます。
-
----
-
-## 参考文献
+## References
 
 [1] Neo4j Graph Database. https://neo4j.com/
 
@@ -685,3 +721,5 @@ graph G {
 [10] Newman, M. E. J., "Networks: An Introduction," Oxford University Press, 2010.
 
 [11] Csardi, G., Nepusz, T., "The igraph software package for complex network research," InterJournal Complex Systems, 1695, 2006. https://igraph.org/
+
+
